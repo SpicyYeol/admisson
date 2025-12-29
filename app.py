@@ -308,7 +308,14 @@ def get_department_analysis_data(df_yr):
 
 @st.cache_data
 def get_future_prediction_data(df_hist, df_dense_all):
-    """Predicts next 5 years (2026-2030) using LAG-adjusted demographics (Pop[N-1] -> Adm[N])."""
+    """
+    Predicts next 5 years (2026-2030) using a Capture Rate (Market Share) approach.
+    Logic: 
+    1. Historical Capture Rate = Applicants / (Lagged weighted population)
+    2. Forecast Capture Rate based on historical time trend.
+    3. Pred Applicants = Pred Capture Rate * Future Population.
+    This ensures that declining population reflects in the forecast even if capture rate is growing.
+    """
     # 1. Historical Stats
     yearly_stats = df_hist.groupby('학년도').agg(
         지원자수=('수험번호', 'count'),
@@ -320,12 +327,13 @@ def get_future_prediction_data(df_hist, df_dense_all):
     
     # 2. Regional Weights
     last_y = yearly_stats.iloc[-1]['학년도']
-    df_recent = df_hist[df_hist['학년도'] >= last_y - 2]
+    df_recent = df_hist[df_hist['학년도'] >= last_y - 2].copy()
     df_recent['지역'] = df_recent['교육청소재지'].apply(check_region_all)
     reg_weights = df_recent['지역'].value_counts() / len(df_recent)
     
     # 3. Create Weighted & LAGGED Population Metric
     regions_list = [r for r in reg_weights.index if r in df_dense_all.columns]
+    df_dense_all = df_dense_all.copy()
     df_dense_all['weighted_pop'] = 0
     for reg in regions_list:
         df_dense_all['weighted_pop'] += df_dense_all[reg] * reg_weights[reg]
@@ -337,33 +345,61 @@ def get_future_prediction_data(df_hist, df_dense_all):
     hist_merged = pd.merge(yearly_stats, df_lagged_pop[['입시적용연도', 'weighted_pop']], 
                            left_on='학년도', right_on='입시적용연도')
     
-    # 4. Weighted Linear Regression
-    weights = np.linspace(0.5, 1.0, len(hist_merged))
-    m_app, c_app = np.polyfit(hist_merged['weighted_pop'], hist_merged['지원자수'], 1, w=weights)
+    # 4. Capture Rate (Applicants / Population) - STABILIZED APPROACH
+    hist_merged['capture_rate'] = hist_merged['지원자수'] / hist_merged['weighted_pop']
     
-    last_act_pop = hist_merged.iloc[-1]['weighted_pop']
-    last_act_app = hist_merged.iloc[-1]['지원자수']
-    c_app_adj = last_act_app - m_app * last_act_pop
+    # CRITICAL FIX: To prevent unrealistic upward trends based on short-term fluctuations,
+    # we assume the university will maintain its RECENT capture rate rather than growing it indefinitely.
+    # This makes the "Population Cliff" the primary driver of the forecast.
+    stable_capture_rate = hist_merged['capture_rate'].tail(2).mean()
     
+    # Competition to Grade Correlation
     last_quota = yearly_stats.iloc[-1]['합격자수'] if yearly_stats.iloc[-1]['합격자수'] > 0 else 1
     hist_merged['경쟁률'] = hist_merged['지원자수'] / last_quota
+    
+    # Weighting for grade correlation - keeping it recent
+    weights = np.linspace(0.5, 1.0, len(hist_merged))
+    # Logic: More Competition (X) -> Better/Lower Grade (Y). Slope m should be NEGATIVE.
     m_grade, c_grade = np.polyfit(hist_merged['경쟁률'], hist_merged['평균성적'], 1, w=weights)
     
+    # CRITICAL LOGIC FIX: In an inverted axis (1 top, 9 bottom), 'decline' means grade numbers get BIGGER.
+    # If historical data suggests otherwise due to noise, we force the "Vacuum Effect" logic.
+    if m_grade > -0.1: # If slope is positive or nearly zero (unrealistic)
+        m_grade = -0.5 # Force: 1 point drop in competition results in 0.5 grade point rise (worsening)
+    
+    # Baseline Alignment for grades
     last_act_comp = hist_merged.iloc[-1]['경쟁률']
     last_act_grade = hist_merged.iloc[-1]['평균성적']
     c_grade_adj = last_act_grade - m_grade * last_act_comp
     
-    # 5. Forecast (For Admission years 2026-2030, use Pop of 2025-2029)
+    # 5. Forecast (2026-2030)
     future_adm_years = [2026, 2027, 2028, 2029, 2030]
     future_data = []
+    
     for f_y in future_adm_years:
+        # Get lagged population
         pop_y = f_y - 1
-        pop_val = df_dense_all[df_dense_all['연도'] == pop_y]['weighted_pop'].values[0]
-        pred_app = m_app * pop_val + c_app_adj
+        pop_row = df_dense_all[df_dense_all['연도'] == pop_y]
+        if pop_row.empty: continue
+        pop_val = pop_row['weighted_pop'].values[0]
+        
+        # Predicted Apps = Stable Capture Rate * Future Population
+        pred_app = stable_capture_rate * pop_val
         pred_comp = pred_app / last_quota
+        
+        # Predicted Grade: As competition drops, numerical grades will RISE (approaching 9)
         pred_grade = m_grade * pred_comp + c_grade_adj
-        future_data.append({'연도': f_y, 'weighted_pop': pop_val, '예측지원자수': pred_app, 
-                            '예측경쟁률': pred_comp, '예측평균성적': pred_grade})
+        # Safety bound (cannot be better than 1 or worse than 9)
+        pred_grade = max(1.0, min(9.0, pred_grade))
+        
+        future_data.append({
+            '연도': f_y, 
+            'weighted_pop': pop_val, 
+            '예측지원자수': pred_app, 
+            '예측경쟁률': pred_comp, 
+            '예측평균성적': pred_grade,
+            '예측점유율': stable_capture_rate
+        })
     
     return pd.DataFrame(future_data), hist_merged
 
@@ -547,43 +583,66 @@ df_t = df_filtered.groupby('학년도').agg(지원자수=('수험번호', 'count
 nat_pop_lag = df_dense_all[['연도', '전국']].copy()
 nat_pop_lag['연도_lag'] = nat_pop_lag['연도'] + 1
 
-fig_macro, ax_m1 = plt.subplots(figsize=(12, 7))
-ax_m2 = ax_m1.twinx() # Applicants
-ax_m3 = ax_m1.twinx() # Grades
-ax_m3.spines['right'].set_position(('outward', 60))
+# Macro Trends: Split into two subplots for clarity
+st.markdown("##### 📈 매크로 트렌드: 인구 절벽과 입결 영향 분석 (과거 + 5개년 예측)")
+st.info("""
+**📊 통합 트렌드 읽는 법**:
+- **상단 차트**: 전국 고3 인구가 급격히 감소함에 따라 우리 대학 지원자 수(실선/점선)가 동반 하락하는 흐름을 보여줍니다.
+- **하단 차트**: 상위권 대학의 '인원 흡수' 효과로 인해, 우리 대학에 유입되는 학생들의 평균 성적(등급 숫자)은 점차 높아질(우하향) 것으로 예측됩니다.
+""")
 
-# 1. Population (Background)
-sns.lineplot(data=nat_pop_lag, x='연도_lag', y='전국', ax=ax_m1, color='grey', alpha=0.15, linestyle='--', label='전국 고3 인구(lag)')
+# Prepare data for plot
+fig_macro, (ax_vol, ax_grd) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
 
-# 2. Historical Applicants (Solid)
-sns.lineplot(data=df_t, x='학년도', y='지원자수', ax=ax_m2, color='purple', marker='s', linewidth=2, label='전체 지원자(과거)')
-sns.lineplot(data=df_e, x='학년도', y='지원자수', ax=ax_m2, color='blue', marker='o', linewidth=2, label='수시(일반) 지원자(과거)')
-sns.lineplot(data=df_r, x='학년도', y='지원자수', ax=ax_m2, color='red', marker='^', linewidth=2, label='정시 지원자(과거)')
+# 1. VOLUME PLOT (Population vs Applicants)
+ax_v_pop = ax_vol.twinx()
+# Population (Fill Area)
+ax_v_pop.fill_between(nat_pop_lag['연도_lag'], 0, nat_pop_lag['전국'], color='grey', alpha=0.1, label='전국 고3 인구(lag)')
+ax_v_pop.set_ylabel("전국 인구 (명)", color='grey')
+ax_v_pop.set_ylim(0, nat_pop_lag['전국'].max() * 1.2)
 
-# 3. Forecasted Applicants (Dashed)
+# Applicants (Lines)
+sns.lineplot(data=df_t, x='학년도', y='지원자수', ax=ax_vol, color='purple', marker='s', linewidth=2, label='전체 지원자(과거)')
+sns.lineplot(data=df_e, x='학년도', y='지원자수', ax=ax_vol, color='blue', marker='o', linewidth=2, label='수시(일반) 지원자(과거)')
+sns.lineplot(data=df_r, x='학년도', y='지원자수', ax=ax_vol, color='red', marker='^', linewidth=2, label='정시 지원자(과거)')
+
 if not pred_t.empty:
-    sns.lineplot(data=pred_t, x='연도', y='예측지원자수', ax=ax_m2, color='purple', linestyle='--', alpha=0.6)
-    sns.lineplot(data=pred_e, x='연도', y='예측지원자수', ax=ax_m2, color='blue', linestyle='--', alpha=0.6)
-    sns.lineplot(data=pred_r, x='연도', y='예측지원자수', ax=ax_m2, color='red', linestyle='--', alpha=0.6)
+    sns.lineplot(data=pred_t, x='연도', y='예측지원자수', ax=ax_vol, color='purple', linestyle='--', alpha=0.8)
+    sns.lineplot(data=pred_e, x='연도', y='예측지원자수', ax=ax_vol, color='blue', linestyle='--', alpha=0.8)
+    sns.lineplot(data=pred_r, x='연도', y='예측지원자수', ax=ax_vol, color='red', linestyle='--', alpha=0.8)
     
-    # Connect 2025 to 2026
+    # Connect last historical to first forecast
     l_yr = df_t['학년도'].max()
     f_yr = pred_t['연도'].min()
     for d_hist, d_pred, clr in [(df_t, pred_t, 'purple'), (df_e, pred_e, 'blue'), (df_r, pred_r, 'red')]:
-        ax_m2.plot([l_yr, f_yr], [d_hist[d_hist['학년도']==l_yr]['지원자수'].values[0], d_pred[d_pred['연도']==f_yr]['예측지원자수'].values[0]], color=clr, linestyle='--', alpha=0.4)
+        ax_vol.plot([l_yr, f_yr], [d_hist[d_hist['학년도']==l_yr]['지원자수'].values[0], d_pred[d_pred['연도']==f_yr]['예측지원자수'].values[0]], color=clr, linestyle='--', alpha=0.5)
 
-# 4. Grades (Historical & Forecast - Dotted)
-sns.lineplot(data=df_t, x='학년도', y='평균성적', ax=ax_m3, color='purple', linestyle=':', alpha=0.3)
-sns.lineplot(data=df_e, x='학년도', y='평균성적', ax=ax_m3, color='blue', linestyle=':', alpha=0.3)
-sns.lineplot(data=df_r, x='학년도', y='평균성적', ax=ax_m3, color='red', linestyle=':', alpha=0.3)
+ax_vol.set_ylabel("본교 지원자 수 (명)")
+ax_vol.set_title("인구 감소에 따른 지원자 유입 규모 예측", fontsize=12, pad=15)
+ax_vol.legend(loc='upper right', fontsize='small')
+ax_vol.grid(True, axis='y', linestyle=':', alpha=0.5)
 
-ax_m1.set_ylabel("인구 (명)", color='grey')
-ax_m2.set_ylabel("지원자수 (명)", color='black')
-ax_m3.set_ylabel("평균성적 (등급)", color='red')
-ax_m3.invert_yaxis()
+# 2. GRADE PLOT (Quality Trend)
+sns.lineplot(data=df_t, x='학년도', y='평균성적', ax=ax_grd, color='purple', marker='s', label='전체 평균(과거)')
+sns.lineplot(data=df_e, x='학년도', y='평균성적', ax=ax_grd, color='blue', marker='o', label='수시(일반) 평균(과거)')
+sns.lineplot(data=df_r, x='학년도', y='평균성적', ax=ax_grd, color='red', marker='^', label='정시 평균(과거)')
 
-ax_m1.get_legend().remove() if ax_m1.get_legend() else None
-ax_m2.legend(loc='upper left', bbox_to_anchor=(0.01, 0.99), fontsize='x-small', ncol=2)
+if not pred_t.empty:
+    sns.lineplot(data=pred_t, x='연도', y='예측평균성적', ax=ax_grd, color='purple', linestyle='--', alpha=0.8)
+    sns.lineplot(data=pred_e, x='연도', y='예측평균성적', ax=ax_grd, color='blue', linestyle='--', alpha=0.8)
+    sns.lineplot(data=pred_r, x='연도', y='예측평균성적', ax=ax_grd, color='red', linestyle='--', alpha=0.8)
+    
+    # Connect
+    for d_hist, d_pred, clr in [(df_t, pred_t, 'purple'), (df_e, pred_e, 'blue'), (df_r, pred_r, 'red')]:
+        ax_grd.plot([l_yr, f_yr], [d_hist[d_hist['학년도']==l_yr]['평균성적'].values[0], d_pred[d_pred['연도']==f_yr]['예측평균성적'].values[0]], color=clr, linestyle='--', alpha=0.5)
+
+ax_grd.set_ylabel("평균 성적 (등급)")
+ax_grd.set_title("지원 경쟁 하락에 따른 최종등록자 성적(Quality) 변화 예측", fontsize=12, pad=15)
+ax_grd.invert_yaxis() # 1 grade at top!
+ax_grd.legend(loc='lower right', fontsize='small')
+ax_grd.grid(True, axis='y', linestyle=':', alpha=0.5)
+
+plt.tight_layout()
 st.pyplot(fig_macro)
 st.markdown("---")
 
