@@ -896,10 +896,10 @@ if not df_sim.empty:
     col_plan1, col_plan2 = st.columns(2)
     with col_plan1:
         st.markdown(f"**📉 감축 대상 (Dog 전형, 총 {abs(reductions['감축인원 (명)'].sum())}명)**")
-        st.dataframe(reductions)
+        st.table(reductions)
     with col_plan2:
         st.markdown(f"**📈 증원 대상 (우수 전형, 총 {expansions['증원인원 (명)'].sum()}명)**")
-        st.dataframe(expansions)
+        st.table(expansions)
     
     # Calculation
     cur_avg_val = cur_reg_students['대표성적'].mean()
