@@ -5,3 +5,4 @@ seaborn
 koreanize-matplotlib
 numpy
 openpyxl
+setuptools
